@@ -1,0 +1,141 @@
+# CI/CD for the todo app.
+#
+# Free-tier notes:
+#   - A PUBLIC Azure DevOps project gets 10 Microsoft-hosted parallel jobs at no cost.
+#     A private project needs Microsoft's free-parallelism request form first.
+#   - Set these pipeline variables after running infra/provision.sh:
+#       azureServiceConnection  name of the ARM service connection in Project Settings
+#       webAppName              the webAppName output from the Bicep deployment
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  buildConfiguration: 'Release'
+  dotnetVersion: '10.0.x'
+  nodeVersion: '24.x'
+  apiProject: 'src/TodoApp.Api/TodoApp.Api.csproj'
+  webDirectory: 'src/todo-web'
+
+stages:
+  - stage: Build
+    displayName: Build and test
+    jobs:
+      - job: BuildAndTest
+        displayName: Build, test, publish
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseDotNet@2
+            displayName: Install .NET SDK
+            inputs:
+              packageType: 'sdk'
+              version: $(dotnetVersion)
+
+          - task: NodeTool@0
+            displayName: Install Node.js
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: npm ci
+            displayName: npm ci
+            workingDirectory: $(webDirectory)
+
+          # Must run BEFORE the .NET build: Vite writes the bundle into the API's
+          # wwwroot, and MSBuild globs that folder when it evaluates the project.
+          - script: npm run build
+            displayName: Build React app into wwwroot
+            workingDirectory: $(webDirectory)
+
+          - script: dotnet restore TodoApp.sln
+            displayName: dotnet restore
+
+          - script: dotnet build TodoApp.sln --no-restore -c $(buildConfiguration)
+            displayName: dotnet build
+
+          - script: >-
+              dotnet test TodoApp.sln
+              --no-build
+              -c $(buildConfiguration)
+              --logger trx
+              --collect "XPlat Code Coverage"
+              --results-directory $(Agent.TempDirectory)/testresults
+            displayName: dotnet test
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: 'VSTest'
+              testResultsFiles: '**/*.trx'
+              searchFolder: '$(Agent.TempDirectory)/testresults'
+              failTaskOnFailedTests: true
+              testRunTitle: 'MSTest - $(Build.SourceBranchName)'
+
+          - task: PublishCodeCoverageResults@2
+            displayName: Publish code coverage
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: '$(Agent.TempDirectory)/testresults/**/coverage.cobertura.xml'
+
+          - script: >-
+              dotnet publish $(apiProject)
+              --no-build
+              -c $(buildConfiguration)
+              -o $(Build.ArtifactStagingDirectory)/api
+            displayName: dotnet publish
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish artifact
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/api'
+              artifactName: 'api'
+
+  - stage: Deploy
+    displayName: Deploy to Azure
+    dependsOn: Build
+    # Only deploy from main; PR builds stop after the Build stage.
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployWebApp
+        displayName: Deploy to App Service
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: api
+
+                - task: AzureWebApp@1
+                  displayName: Deploy to App Service (F1)
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appType: 'webAppLinux'
+                    appName: $(webAppName)
+                    package: '$(Pipeline.Workspace)/api'
+                    runtimeStack: 'DOTNETCORE|10.0'
+
+                - script: |
+                    set -e
+                    url="https://$(webAppName).azurewebsites.net/healthz"
+                    echo "Checking $url"
+                    # F1 has no Always On, so the first request after a deploy cold-starts.
+                    for attempt in $(seq 1 12); do
+                      code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$url" || echo 000)
+                      echo "attempt $attempt: HTTP $code"
+                      [ "$code" = "200" ] && exit 0
+                      sleep 10
+                    done
+                    echo "Health check never returned 200"
+                    exit 1
+                  displayName: Smoke test /healthz
